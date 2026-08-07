@@ -69,7 +69,7 @@ class VadConfig:
     threshold: float = 0.5
     min_speech_ms: int = 250
     #: Trailing silence that closes a segment. Lower = snappier but choppier.
-    min_silence_ms: int = 700
+    min_silence_ms: int = 300
     #: Audio kept either side of detected speech so consonants are not clipped.
     speech_pad_ms: int = 200
     #: Hard cut for someone who never pauses, so captions keep flowing.

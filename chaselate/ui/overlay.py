@@ -15,7 +15,7 @@ Two things drive most of the structure here:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
@@ -78,7 +78,8 @@ USABLE_MIN_SIZE = QSize(900, 260)
 PLAUSIBLE_SCREEN = QSize(800, 480)
 #: Minimum clearance left either side when the strip cannot have its preferred width.
 EDGE_MARGIN = 16
-#: Slack in pixels within which the caption view counts as "scrolled to the bottom".
+#: Slack in pixels within which a scrollbar value counts as "where we last put it ourselves"
+#: rather than a manual scroll away from it. See _on_scroll_value_changed.
 AUTOSCROLL_SLACK = 6
 
 
@@ -218,6 +219,21 @@ class OverlayWindow(QWidget):
 
         self._blocks: Dict[int, CaptionBlock] = {}
         self._order: List[int] = []
+        #: id of the block currently marked "active" (still awaiting translation), or None.
+        self._active_uid: Optional[int] = None
+        #: Whether the view should keep repositioning itself as new content arrives. A manual
+        #: scroll turns this off; the jump pill turns it back on. See _on_scroll_value_changed.
+        self._auto_follow = True
+        #: True only for the instant _scroll_to's own bar.setValue() call is on the stack, so
+        #: _on_scroll_value_changed can tell our own moves apart from a genuine user scroll.
+        self._applying_scroll = False
+        #: Bumped to invalidate any in-flight _scroll_to "catch up" still connected; see
+        #: _scroll_to for why a plain disconnect is not enough on its own.
+        self._scroll_chase_gen = 0
+        self._scroll_chase_conn: Optional[Callable] = None
+        #: Bumped on every _defer_canvas_height_sync call so a later call's re-check ticks can
+        #: tell an earlier, superseded call's ticks apart from their own and skip.
+        self._canvas_height_sync_gen = 0
         self._settings_dialog: Optional[SettingsDialog] = None
         self._quitting = False
         self._drag_origin: Optional[QPoint] = None
@@ -262,6 +278,8 @@ class OverlayWindow(QWidget):
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(16, 16)
         self._grip.setToolTip("Drag to resize")
+
+        self._build_jump_pill()
 
     def _build_top_bar(self) -> QWidget:
         bar = QFrame(self.root)
@@ -367,8 +385,95 @@ class OverlayWindow(QWidget):
         self.placeholder.setWordWrap(True)
         self.canvas_layout.addWidget(self.placeholder)
 
+        # Trailing room so the most recent (likely still-active) sentence can actually be
+        # scrolled to the middle of the view. Centring the *last* item in an AlignTop stack has
+        # nowhere to go without this: there is nothing below it to make room by scrolling
+        # further. Kept as a real widget rather than a QSpacerItem so _sync_canvas_height's
+        # heightForWidth() aggregation picks it up like any other item, no special-casing
+        # needed. Height is kept at roughly half the viewport by _sync_canvas_height; the
+        # bottom-follow target (see _content_bottom / _follow_target) deliberately does not
+        # scroll into it, so it never reintroduces the blank-space-at-the-bottom bug this
+        # exists alongside a fix for -- it is scroll range that only centring ever uses.
+        self.canvas_tail_spacer = QWidget(self.canvas)
+        self.canvas_tail_spacer.setObjectName("CaptionTailSpacer")
+        self.canvas_layout.addWidget(self.canvas_tail_spacer)
+
         self.scroll.setWidget(self.canvas)
+        bar = self.scroll.verticalScrollBar()
+        # Deliberately two different slots, not one shared by both signals: a rangeChanged
+        # event fires *before* a chase (see _scroll_to_bottom) has had a chance to catch the
+        # scrollbar up to a still-growing range, so checking "are we at the bottom" from a
+        # rangeChanged handler would see a false negative and cancel the very chase meant to
+        # fix it. Only a genuine value change -- the scrollbar actually moving, which is what a
+        # manual scroll looks like -- is trustworthy evidence that the user moved away.
+        bar.valueChanged.connect(self._on_scroll_value_changed)
+        # New content changes what "at the bottom" means even if the user has not touched the
+        # scrollbar, so a caption arriving while they are reading up must be able to reveal
+        # the pill immediately rather than waiting for the next manual scroll. Visibility only,
+        # no cancellation here -- see above.
+        bar.rangeChanged.connect(self._update_jump_pill)
         return self.scroll
+
+    def _build_jump_pill(self) -> None:
+        """The "you have scrolled away" affordance.
+
+        Parented to ``self.root`` rather than the scroll area: QScrollArea manages its own
+        children (viewport, scrollbars), and an extra widget dropped into that hierarchy is
+        liable to be fought over by its layout. A sibling positioned by hand -- the same
+        approach already used for the resize grip -- has no such conflict.
+        """
+        self._jump_pill = QToolButton(self.root)
+        self._jump_pill.setObjectName("JumpPill")
+        self._jump_pill.setCursor(Qt.PointingHandCursor)
+        self._jump_pill.clicked.connect(self._jump_to_latest)
+        self._jump_pill.hide()
+
+    def _pill_text(self) -> str:
+        return "▾ Translating — click to follow" if self._active_uid is not None else "▾ New captions"
+
+    def _jump_to_latest(self) -> None:
+        self._auto_follow = True
+        self._scroll_to(self._follow_target())
+        # Optimistic: the real scroll is deferred a frame (see _scroll_to), but hiding
+        # immediately avoids a click feeling like it did nothing for that frame.
+        self._jump_pill.hide()
+
+    def _on_scroll_value_changed(self, _value: int) -> None:
+        # self._applying_scroll brackets our own bar.setValue() calls (see _scroll_to), so
+        # anything landing here while it is False is unambiguously not us -- a manual scroll, a
+        # wheel event, a drag, anything. Comparing the new value against where we last put it
+        # was tried first and is not reliable enough: a chase from a still-loading block can be
+        # armed and waiting when the user scrolls, and if their landing spot happens to be
+        # within a few pixels of that stale target, a value-only check would wrongly treat the
+        # manual scroll as "still following". A flag set only for the instant of our own call
+        # has no such coincidence to worry about.
+        if not self._applying_scroll:
+            self._auto_follow = False
+            self._cancel_scroll_chase()
+        self._update_jump_pill()
+
+    def _update_jump_pill(self, *_args) -> None:
+        if not hasattr(self, "_jump_pill"):
+            return
+        show = bool(self._order) and not self._auto_follow
+        if show:
+            self._jump_pill.setText(self._pill_text())
+            self._jump_pill.adjustSize()
+            self._position_jump_pill()
+        self._jump_pill.setVisible(show)
+
+    def _position_jump_pill(self) -> None:
+        if not hasattr(self, "_jump_pill") or not hasattr(self, "scroll"):
+            return
+        size = self._jump_pill.sizeHint()
+        # scroll's geometry is in self.root's coordinate space, which is exactly the parent
+        # the pill lives in, so no mapping is needed -- just anchor to its bottom edge.
+        area = self.scroll.geometry()
+        x = area.x() + (area.width() - size.width()) // 2
+        y = area.y() + area.height() - size.height() - 10
+        self._jump_pill.move(max(area.x(), x), max(area.y(), y))
+        self._jump_pill.resize(size)
+        self._jump_pill.raise_()
 
     def _build_status_bar(self) -> QWidget:
         self.status_bar = QFrame(self.root)
@@ -500,7 +605,13 @@ class OverlayWindow(QWidget):
             self._act_clickthrough.setChecked(bool(ui.mouse_transparent))
         if rebuild_blocks:
             self._rebuild_blocks()
+        else:
+            # A font-size-only change (no layout/rebuild) still changes each block's needed
+            # height at the same width; the style needs a layout pass to actually apply to the
+            # existing labels first, hence the deferred sync rather than an immediate one.
+            self._defer_canvas_height_sync()
         self._position_grip()
+        self._position_jump_pill()
 
     def apply_config(self, config: AppConfig) -> None:
         """Adopt an edited config: restyle, relayout, and hand it to the pipeline."""
@@ -549,33 +660,256 @@ class OverlayWindow(QWidget):
         kept = list(self._order)
         self._order.clear()
         for utterance in utterances:
-            self._add_block(utterance, autoscroll=False)
+            self._add_block(utterance)
+        self._defer_canvas_height_sync()  # each _add_block already schedules this; once more for good measure
+        active_survived = self._active_uid in self._blocks
+        if not active_survived:
+            self._active_uid = None
         if kept:
-            self._scroll_to_bottom()
+            # Block heights can change completely under a rebuild (side <-> stacked layout,
+            # original text shown or hidden), so the old scroll position does not mean
+            # anything in the new one -- always reposition rather than respecting a pause
+            # that applied to a layout that no longer exists.
+            self._auto_follow = True
+            if active_survived:
+                # Re-applies the "active" highlight to the freshly-built block (a rebuild
+                # replaces every CaptionBlock instance) and, since _auto_follow is now True,
+                # centres on it via _set_active's own call to _follow().
+                self._set_active(self._active_uid)
+            else:
+                self._follow()
+        self._update_jump_pill()
 
     # -- caption plumbing --------------------------------------------------
 
-    def _at_bottom(self) -> bool:
+    def _cancel_scroll_chase(self) -> None:
+        """Invalidate any in-flight "catch up" from a previous _scroll_to call.
+
+        Bumping the generation makes the chase closure below a no-op even if its disconnect
+        has not run yet, which matters because the two can otherwise race: a chase armed by an
+        earlier reposition must not override a scroll the user makes a moment later, just
+        because a range-changed event from unrelated new content happens to land inside its
+        window.
+        """
+        self._scroll_chase_gen += 1
+        if self._scroll_chase_conn is not None:
+            try:
+                self.scroll.verticalScrollBar().rangeChanged.disconnect(self._scroll_chase_conn)
+            except TypeError:
+                pass  # already disconnected
+            self._scroll_chase_conn = None
+
+    def _scroll_to(self, compute_target: Callable[[], int]) -> None:
+        """Move to ``compute_target()``, and stay there through any layout passes still in
+        flight, marking this as the new auto-follow position.
+
+        A single deferred tick is not enough: a brand-new block (or one that just grew from a
+        streamed translation) has no correct height/position until Qt has actually laid it out,
+        which for a multi-line label can take more than one event-loop turn (word wrap needs a
+        real width first). Setting the scrollbar once, immediately, can therefore land on the
+        wrong value with no second chance to correct it -- confirmed by a test that emits a
+        block and then polls for up to 400ms without the scrollbar ever reaching the right
+        value. So: apply the target immediately for the common case (content already laid out),
+        and re-evaluate and reapply it on every range change for a short window afterwards, in
+        case this one has not settled yet. ``compute_target`` is called fresh each time rather
+        than evaluated once up front for exactly this reason.
+
+        The chase is tagged with a generation so a later call -- including one made because the
+        user scrolled away in the meantime -- can invalidate it instead of two chases fighting
+        over the scrollbar.
+        """
         bar = self.scroll.verticalScrollBar()
-        return bar.value() >= bar.maximum() - AUTOSCROLL_SLACK
+
+        def _apply() -> None:
+            # Safety net: whichever content-changing path led here, make sure the canvas's
+            # height is honest before computing a target against it (see _sync_canvas_height).
+            # Idempotent and cheap when it is already correct, so unconditional is fine.
+            self._sync_canvas_height()
+            value = compute_target()
+            self._applying_scroll = True
+            try:
+                bar.setValue(value)
+            finally:
+                self._applying_scroll = False
+
+        self._auto_follow = True
+        _apply()
+
+        self._cancel_scroll_chase()
+        gen = self._scroll_chase_gen
+
+        def _chase(_min=None, _max=None, gen=gen) -> None:
+            if gen == self._scroll_chase_gen:
+                _apply()
+
+        self._scroll_chase_conn = _chase
+        bar.rangeChanged.connect(_chase)
+        QTimer.singleShot(150, self._cancel_scroll_chase_if_current(gen))
+
+    def _cancel_scroll_chase_if_current(self, gen: int) -> Callable[[], None]:
+        def _end() -> None:
+            if gen == self._scroll_chase_gen:
+                self._cancel_scroll_chase()
+        return _end
 
     def _scroll_to_bottom(self) -> None:
-        # Deferred: the new block has no height until the layout has run.
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()
-        ))
+        self._scroll_to(lambda: self.scroll.verticalScrollBar().maximum())
 
-    def _add_block(self, utterance: Utterance, autoscroll: bool = True) -> CaptionBlock:
-        stick = autoscroll and self._at_bottom()
+    def _centered_scroll_value(self, uid: int) -> int:
+        """Scrollbar value that puts block ``uid`` in the middle of the visible area."""
+        bar = self.scroll.verticalScrollBar()
+        block = self._blocks.get(uid)
+        if block is None:
+            return bar.maximum()
+        # block.y() is already in self.canvas's coordinate space, which is exactly what the
+        # scrollbar's value represents (QScrollArea offsets the widget it owns by that many
+        # pixels), so no coordinate mapping is needed here.
+        viewport_height = self.scroll.viewport().height()
+        center_y = block.y() + block.height() / 2.0
+        value = int(round(center_y - viewport_height / 2.0))
+        return max(0, min(value, bar.maximum()))
+
+    def _follow_target(self) -> Callable[[], int]:
+        """What "the current position" means right now.
+
+        Centred on the actively-translating sentence when there is one -- so the line the user
+        cares about most sits in a comfortable reading position rather than jammed against the
+        bottom edge next to the status bar and the jump pill -- otherwise the bottom, so a
+        transcribe-only session (nothing ever becomes "active") still tracks new lines.
+
+        "The bottom" here means the last real caption's bottom edge lined up with the viewport,
+        via _content_bottom() -- not bar.maximum(), which also spans the trailing spacer
+        reserved for centring (see _build_captions). Landing there would put the view exactly
+        in the blank space this whole mechanism exists to stop happening.
+        """
+        uid = self._active_uid
+        if uid is not None:
+            return lambda: self._centered_scroll_value(uid)
+        return self._bottom_of_content_target
+
+    def _bottom_of_content_target(self) -> int:
+        bar = self.scroll.verticalScrollBar()
+        value = self._content_bottom() - self.scroll.viewport().height()
+        return max(0, min(value, bar.maximum()))
+
+    def _follow(self) -> None:
+        """Reposition to the current focus (see _follow_target), but only while following.
+
+        Call this whenever what "the current focus" is could have changed -- a new sentence
+        becoming active, a translation streaming in and changing that block's height. A no-op
+        while the user has scrolled away, which is the entire point of auto-follow being
+        pausable: this is safe to call unconditionally from those events without re-litigating
+        whether the user wanted to be moved.
+        """
+        if self._auto_follow:
+            self._scroll_to(self._follow_target())
+
+    def _add_block(self, utterance: Utterance) -> CaptionBlock:
+        """Add the widget for one utterance. Purely mechanical: callers decide whether and
+        where to scroll afterwards (see _follow), since that depends on things -- is
+        translation enabled, is this utterance becoming the active one -- that this method
+        has no business knowing about."""
         self.placeholder.setVisible(False)
         block = CaptionBlock(utterance, self.config.ui, self.canvas)
-        self.canvas_layout.addWidget(block)
+        # Insert before the trailing spacer (always the last item), not append -- appending
+        # would push the spacer into the middle of the stack instead of leaving it trailing.
+        self.canvas_layout.insertWidget(self.canvas_layout.count() - 1, block)
         self._blocks[utterance.id] = block
         self._order.append(utterance.id)
-        self._trim_history()
-        if stick:
-            self._scroll_to_bottom()
+        self._trim_history()  # always resyncs the canvas height, even when nothing was trimmed
+        # The scroll range has not been recalculated for this block yet (it has no height
+        # until the next layout pass), but if the user is already away from wherever we'd
+        # follow to, there is no need to wait for that to show the pill.
+        self._update_jump_pill()
         return block
+
+    def _sync_canvas_height(self) -> None:
+        """Keep the caption canvas's actual height matched to what it needs at its actual width.
+
+        QScrollArea's ``setWidgetResizable(True)`` sizes the content widget from its
+        ``sizeHint()``, but ``sizeHint()`` is computed without any width in mind -- it cannot
+        be, since the layout does not yet know how wide it will end up. For content with
+        wrapped, multi-line labels this can measurably overshoot the height the widget actually
+        needs at its real (viewport-constrained) width, since heightForWidth-aware negotiation
+        only happens once a width is actually assigned. The gap does not correct itself and
+        grows with every block added, eventually leaving a stretch of true blank canvas below
+        the last real caption that scrolling to "the bottom" lands in.
+
+        ``heightForWidth()``, given the widget's actual current width, computes the correct
+        answer (confirmed empirically: it matches the measured position of the last block's
+        bottom edge, while ``sizeHint()`` at the same moment does not). Forcing the canvas to
+        that height keeps it honest. This does not fight ``setWidgetResizable``'s WIDTH
+        tracking -- only height is set here, and QScrollArea keeps sizing the width to the
+        viewport as normal.
+        """
+        self._sync_tail_spacer()
+        canvas = self.canvas
+        width = canvas.width()
+        if width <= 0:
+            return
+        correct_height = canvas.heightForWidth(width)
+        if correct_height > 0 and correct_height != canvas.height():
+            canvas.setFixedHeight(correct_height)
+
+    def _sync_tail_spacer(self) -> None:
+        """Keep the trailing spacer at roughly half the viewport, so the most recent sentence
+        always has room to be scrolled up to the middle. See its creation in _build_captions."""
+        viewport_height = self.scroll.viewport().height()
+        target = max(0, viewport_height // 2)
+        if self.canvas_tail_spacer.minimumHeight() != target:
+            self.canvas_tail_spacer.setFixedHeight(target)
+
+    def _content_bottom(self) -> int:
+        """Bottom edge of the last real caption block, in canvas coordinates -- i.e. excluding
+        the trailing spacer. This is "the bottom" for jump-to-latest / transcribe-only-mode
+        follow purposes; bar.maximum() is not, since it also covers the spacer's reserved
+        centring room and landing there is exactly the blank-space bug this method exists to
+        avoid reintroducing.
+        """
+        if not self._order:
+            return 0
+        block = self._blocks.get(self._order[-1])
+        if block is None:
+            return 0
+        return block.y() + block.height()
+
+    #: Delays (ms) at which a deferred canvas-height sync re-checks itself. A single deferred
+    #: tick is enough for a plain text/content change, but a structural change -- a layout mode
+    #: switch restructuring every block's internal QHBoxLayout/QVBoxLayout, in particular --
+    #: can take Qt more than one event-loop turn to fully settle; confirmed empirically, where
+    #: one deferred tick landed on an intermediate height thirty-odd pixels short of the real
+    #: one and nothing ever corrected it afterwards. Chasing across a few frame-paced ticks
+    #: catches that without guessing a single "surely long enough" delay.
+    _CANVAS_HEIGHT_CHASE_DELAYS_MS = (0, 16, 50, 120)
+
+    def _defer_canvas_height_sync(self) -> None:
+        """Schedule _sync_canvas_height across the next few event-loop turns, not run it now.
+
+        Calling it synchronously in the same call stack as canvas_layout.addWidget() (or a
+        label's setText()) reads a *stale* heightForWidth(): Qt's layout invalidation from that
+        change has not actually been processed yet, so the query answers "what did you need
+        before this change", not after. A *single* deferred tick fixes the common case (one new
+        block, one text update) but is not always enough for a structural change like a layout
+        mode switch, which can take Qt more than one turn to fully re-settle -- so this re-syncs
+        at each delay in _CANVAS_HEIGHT_CHASE_DELAYS_MS rather than trusting the first one.
+
+        Coalesced via a generation counter: a new call supersedes any still-pending re-checks
+        from an earlier one instead of running two overlapping chases, the same pattern
+        _scroll_to uses for its own catch-up and for the same reason -- a later call reflects
+        more current intent than an earlier one still in flight.
+        """
+        self._canvas_height_sync_gen += 1
+        gen = self._canvas_height_sync_gen
+
+        def _run(gen=gen) -> None:
+            if gen != self._canvas_height_sync_gen:
+                return  # superseded by a later call; that one's ticks will finish the job
+            self._sync_canvas_height()
+
+        for delay in self._CANVAS_HEIGHT_CHASE_DELAYS_MS:
+            QTimer.singleShot(delay, _run)
+
+        QTimer.singleShot(0, _run)
 
     def _trim_history(self) -> None:
         limit = max(1, int(self.config.ui.max_history))
@@ -585,34 +919,83 @@ class OverlayWindow(QWidget):
             if block is not None:
                 block.setParent(None)
                 block.deleteLater()
+            if self._active_uid == uid:
+                self._active_uid = None
+        self._defer_canvas_height_sync()
+
+    def _set_active(self, uid: Optional[int]) -> None:
+        """Move the "currently translating" highlight to ``uid`` (or clear it for None)."""
+        if self._active_uid is not None and self._active_uid != uid:
+            prev = self._blocks.get(self._active_uid)
+            if prev is not None:
+                CaptionBlock._set_prop(prev, "active", "false")
+        self._active_uid = uid
+        if uid is not None:
+            block = self._blocks.get(uid)
+            if block is not None:
+                CaptionBlock._set_prop(block, "active", "true")
+        # The pill's wording depends on whether something is actively translating; refresh it
+        # in place so it does not show stale text while it happens to already be visible.
+        self._update_jump_pill()
+        if uid is not None:
+            # A newly active sentence is a new "current focus" to centre on. Deliberately not
+            # called when clearing to None (a translation finishing): the view should hold
+            # still until something new actually happens, not jump to the bottom the instant
+            # a block resolves with nothing else having arrived yet.
+            self._follow()
+
+    def _mark_resolved(self, uid: int) -> None:
+        """Drop the highlight once a block's translation has settled (done/failed/skipped).
+
+        Only acts if ``uid`` is still the active one -- a newer sentence may already have
+        taken the highlight over, in which case this arrival is old news and should not
+        touch anything.
+        """
+        if self._active_uid == uid:
+            self._set_active(None)
 
     def _on_utterance(self, utterance: object) -> None:
         if not isinstance(utterance, Utterance):
             log.debug("ignoring unexpected utterance payload: %r", type(utterance))
             return
         self._add_block(utterance)
+        if self.config.translate.enabled:
+            # _set_active follows to centre on it. Only when translation is actually running:
+            # with it disabled, no translation_done/_failed signal will ever arrive for this
+            # utterance to clear the highlight, so it would stay lit forever.
+            self._set_active(utterance.id)
+        else:
+            # Nothing will ever become "active" in this mode, so _follow's fallback target
+            # (the bottom) is what keeps a transcribe-only session tracking new lines.
+            self._follow()
 
     def _on_delta(self, uid: int, text: str) -> None:
         block = self._blocks.get(uid)
         if block is not None:
-            stick = self._at_bottom()
             block.set_translation(text, pending=True)
-            if stick:
-                self._scroll_to_bottom()
+            self._defer_canvas_height_sync()
+            # A streamed translation can grow the block by several lines, shifting where its
+            # centre is; re-centre on it as it grows rather than only once when it arrives.
+            # _scroll_to's own chase picks up the deferred sync above once it lands.
+            self._follow()
 
     def _on_done(self, uid: int, text: str) -> None:
         block = self._blocks.get(uid)
         if block is not None:
-            stick = self._at_bottom()
             block.utterance.state = "done"
             block.set_translation(text, pending=False)
-            if stick:
-                self._scroll_to_bottom()
+            self._defer_canvas_height_sync()
+            # The final text can differ slightly from the last streamed delta (cleanup applied
+            # to the completed translation), so absorb one last possible height change before
+            # the highlight -- and with it, further re-centring -- goes away.
+            self._follow()
+        self._mark_resolved(uid)
 
     def _on_failed(self, uid: int, message: str) -> None:
         block = self._blocks.get(uid)
         if block is not None:
             block.set_failed(message)
+        self._mark_resolved(uid)
 
     # -- status ------------------------------------------------------------
 
@@ -905,6 +1288,12 @@ class OverlayWindow(QWidget):
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
         self._position_grip()
+        self._position_jump_pill()
+        # heightForWidth is, as the name says, a function of width: a window resize changes
+        # the canvas's viewport width, which changes the correct height too. Deferred because
+        # the scroll area's own width-to-viewport sync may not have propagated down to the
+        # canvas yet at the moment this outer window's resizeEvent fires.
+        self._defer_canvas_height_sync()
 
     # -- window behaviour --------------------------------------------------
 

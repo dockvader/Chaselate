@@ -155,7 +155,7 @@ Everything is adjustable in the settings dialog (`Ctrl+,`) and persisted to
 
 | Setting | Effect |
 |---|---|
-| `min_silence_ms` (700) | Trailing silence that ends an utterance. Lower = captions appear sooner but break mid-sentence more. |
+| `min_silence_ms` (300) | Trailing silence that ends an utterance. Lower = captions appear sooner but break mid-sentence more. |
 | `speech_pad_ms` (200) | Audio kept either side of detected speech. Too low clips leading consonants and Whisper starts guessing. |
 | `max_segment_s` (14) | Hard cut for a speaker who never pauses. The next segment overlaps the cut so no audio is lost. |
 | `silence_rms` (0.0009) | Below this, a block is silence and the VAD is not consulted. Raise it if a noisy room produces phantom captions. |

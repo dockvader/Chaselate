@@ -29,6 +29,7 @@ DARK: Dict[str, str] = {
     "text_faint": "rgba(233, 238, 247, 105)",
     "accent": "#6fd0ff",
     "accent_dim": "rgba(111, 208, 255, 55)",
+    "accent_hover": "#8ddbff",
     "good": "#7ee2a8",
     "warn": "#ffc46b",
     "bad": "#ff8b8b",
@@ -50,6 +51,7 @@ LIGHT: Dict[str, str] = {
     "text_faint": "rgba(21, 25, 34, 115)",
     "accent": "#0d6fa8",
     "accent_dim": "rgba(13, 111, 168, 46)",
+    "accent_hover": "#0a5a89",
     "good": "#1d8a52",
     "warn": "#9a6212",
     "bad": "#b32626",
@@ -187,6 +189,27 @@ QComboBox QAbstractItemView {{
     border-radius: 10px;
 }}
 #CaptionBlock[failed="true"] {{ border-color: {c["bad"]}; }}
+/* The one sentence still being translated: same accent used for the level meter and combo
+   focus, so "this is live" reads consistently across the window. */
+#CaptionBlock[active="true"] {{
+    background: {c["accent_dim"]};
+    border: 1px solid {c["accent"]};
+}}
+
+/* Floating "jump to latest" chip, shown over the caption area while the user has scrolled
+   away from the bottom. Solid accent rather than the block's accent_dim: it sits on top of
+   caption content and needs to read clearly at a glance, not blend in. */
+#JumpPill {{
+    background: {c["accent"]};
+    color: {c["plate"]};
+    border: none;
+    border-radius: 999px;
+    padding: 5px 14px;
+    font-size: {small_pt}pt;
+    font-weight: 600;
+}}
+#JumpPill:hover {{ background: {c["accent_hover"]}; }}
+#JumpPill:pressed {{ background: {c["accent_hover"]}; padding-top: 6px; padding-bottom: 4px; }}
 
 #OriginalText {{
     color: {c["text_dim"]};
