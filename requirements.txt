@@ -1,0 +1,25 @@
+# Chaselate runtime dependencies (Windows, Python 3.10-3.12)
+#
+# Verified against Python 3.12.0 on Windows 11.
+
+PyQt5>=5.15.9,<6
+
+# Speech recognition. Pulls in ctranslate2, tokenizers, huggingface-hub and av.
+faster-whisper>=1.1.0,<2
+
+# Silero VAD runs on onnxruntime, which faster-whisper depends on.
+#
+# The upper bound is not cosmetic: onnxruntime 1.28.0 fails at import on this platform with
+# "DLL load failed while importing onnxruntime_pybind11_state", which takes the VAD down with
+# it. 1.26.0 is the newest version verified working here; 1.20.1 also works. Raise the bound
+# only after actually importing the new version on Windows.
+onnxruntime>=1.20,<1.27
+
+# WASAPI loopback capture. soundcard is the primary backend (pure cffi, no build step);
+# PyAudioWPatch is the fallback for machines where soundcard's COM enumeration fails.
+# Either one alone is sufficient.
+soundcard>=0.4.3
+PyAudioWPatch>=0.2.12.7
+
+numpy>=1.24
+requests>=2.31

@@ -1,0 +1,17 @@
+# Optional: GPU acceleration for speech recognition.
+#
+# Install these only if you have an NVIDIA GPU and no system-wide CUDA 12 toolkit. They are
+# large (~1.9 GB unpacked) because cuDNN ships precompiled kernels for every architecture.
+#
+#     .venv\Scripts\python.exe -m pip install -r requirements-cuda.txt
+#
+# CTranslate2 (inside faster-whisper) loads these with a plain LoadLibrary call, which
+# searches PATH but not the directories registered by os.add_dll_directory. Chaselate
+# therefore prepends the wheel directories to PATH at startup -- see
+# chaselate/asr.py:ensure_cuda_libraries. Nothing needs to be added to PATH by hand.
+#
+# Skip this file to run on CPU. A "small" model on CPU with int8 runs at roughly a quarter of
+# realtime, which keeps up with live speech; the GPU is about three times faster again.
+
+nvidia-cublas-cu12>=12.3
+nvidia-cudnn-cu12>=9,<10
