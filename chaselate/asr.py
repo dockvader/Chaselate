@@ -61,6 +61,18 @@ def ensure_cuda_libraries() -> bool:
         added: List[str] = []
         spec = importlib.util.find_spec("nvidia")
         roots = list(spec.submodule_search_locations) if spec and spec.submodule_search_locations else []
+
+        # A frozen build (PyInstaller) has no "nvidia" pip package for find_spec to locate --
+        # find_spec looks for an installed Python package, and a frozen app's CUDA support is
+        # just DLLs the installer dropped next to the executable (see packaging/installer.nsi's
+        # optional CUDA component), not a package. Check the same nvidia/<lib>/bin layout next
+        # to the executable so ensure_cuda_libraries works the same way whether the process is
+        # a normal venv run or a frozen one.
+        if getattr(sys, "frozen", False):
+            frozen_nvidia_dir = os.path.join(os.path.dirname(sys.executable), "nvidia")
+            if os.path.isdir(frozen_nvidia_dir):
+                roots.append(frozen_nvidia_dir)
+
         for root in roots:
             for pattern in ("*/bin", "*/lib"):
                 for path in glob.glob(os.path.join(root, pattern)):

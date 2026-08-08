@@ -16,6 +16,11 @@ Windows 版即時語音翻譯字幕條。移植自 macOS 的 KazKozDev/live-tran
 
 翻譯需要 Ollama 在跑（`ollama serve`）並已 `ollama pull translategemma`。
 
+打包成安裝檔（PyInstaller 凍結＋NSIS）在 `packaging/`，細節見 `packaging/README.md`。
+凍結後的 exe 有一個跟原始碼不一樣的坑：PyQt5 自帶的 msvcp140.dll 會被 PyInstaller 自動收集
+進去，而且它的開機流程會搶在 `chaselate/_runtime.py` 的修正碼之前載入 PyQt5，所以
+`chaselate.spec` 改用「打包時直接排除那幾個 DLL」而非「搶時間先載入系統版」。
+
 ## 怎麼驗證（這個專案沒有 CI，驗證靠手動實跑）
 
 改動後**至少**跑對應那一層：

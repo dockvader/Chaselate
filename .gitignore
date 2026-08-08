@@ -20,6 +20,11 @@ parts/
 sdist/
 var/
 wheels/
+
+# NSIS installer output: packaging/dist/ and packaging/build/ are already covered above by
+# the generic dist//build/ rules; the installer .exe itself sits directly in packaging/ (see
+# packaging/installer.nsi's OutFile) and needs its own rule, regenerable and ~90 MB.
+packaging/ChaselateSetup-*.exe
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -31,6 +36,11 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# ...except ours: packaging/chaselate.spec is hand-written and holds real, non-regenerable
+# engineering (the MSVC-runtime-DLL-stripping fix documented in packaging/README.md's
+# "known landmines" section, in particular) -- losing it from version control would lose
+# that, not just a disposable template output.
+!packaging/chaselate.spec
 
 # Installer logs
 pip-log.txt

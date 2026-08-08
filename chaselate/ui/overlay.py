@@ -26,8 +26,10 @@ from PyQt5.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
+    QRadialGradient,
 )
 from PyQt5.QtWidgets import (
     QAction,
@@ -59,7 +61,7 @@ from ..pipeline import (
     Utterance,
 )
 from .settings import SettingsDialog, wait_for_background_jobs
-from .style import build_stylesheet, palette
+from .style import build_stylesheet, palette, qcolor
 
 log = logging.getLogger(__name__)
 
@@ -551,19 +553,67 @@ class OverlayWindow(QWidget):
             log.debug("system tray unavailable", exc_info=True)
 
     def _make_icon(self) -> QIcon:
-        """Draw the tray icon so the app needs no image files on disk."""
-        pixmap = QPixmap(64, 64)
+        """Draw the tray icon so the app needs no image files on disk.
+
+        Same three-chevron mark as the packaged exe's icon (see
+        packaging/scripts/make_icon.py for the full account of what it is meant to evoke) --
+        drawn here at runtime instead of loaded from a file so the accent colour can follow
+        the user's light/dark theme choice the same way the rest of the chrome does.
+        """
+        size = 64
+        pixmap = QPixmap(size, size)
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # qcolor(), not QColor(...) directly: several palette entries (including "plate",
+        # used right below) are written in CSS's rgba(r, g, b, a) form for the stylesheet's
+        # sake, which QColor's own string constructor does not parse -- it fails silently to
+        # an invalid, opaque-black colour rather than raising. See style.qcolor's docstring.
         colors = palette(self.config.ui.theme)
-        painter.setBrush(QColor(colors.get("accent", "#6fd0ff")))
-        painter.setPen(QPen(QColor(255, 255, 255, 120), 2))
-        painter.drawEllipse(3, 3, 58, 58)
-        font = QFont("Segoe UI", 30, QFont.Bold)
-        painter.setFont(font)
-        painter.setPen(QColor(12, 16, 24))
-        painter.drawText(pixmap.rect(), Qt.AlignCenter, "C")
+        plate = qcolor(colors.get("plate", "#0e1016"))
+        plate.setAlpha(255)
+        accent = qcolor(colors.get("accent", "#6fd0ff"))
+        text = qcolor(colors.get("text", "#f2f4f8"))
+
+        radius = size * 0.225
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(plate)
+        painter.drawRoundedRect(0, 0, size, size, radius, radius)
+
+        glow_cx, glow_cy, glow_r = size * 0.665, size * 0.5, size * 0.34
+        glow = QRadialGradient(glow_cx, glow_cy, glow_r)
+        glow_color = QColor(accent)
+        glow_color.setAlpha(90)
+        glow.setColorAt(0.0, glow_color)
+        glow_edge = QColor(accent)
+        glow_edge.setAlpha(0)
+        glow.setColorAt(1.0, glow_edge)
+        painter.setBrush(glow)
+        painter.drawEllipse(
+            int(glow_cx - glow_r), int(glow_cy - glow_r), int(glow_r * 2), int(glow_r * 2)
+        )
+
+        half_w, half_h = size * 0.115, size * 0.195
+        stroke_w = size * 0.075
+        spacing = size * 0.185
+        start_x = size * 0.5 - spacing
+        cy = size * 0.5
+        for i in range(3):
+            cx = start_x + spacing * i
+            t = i / 2.0
+            color = QColor(
+                round(text.red() + (accent.red() - text.red()) * t),
+                round(text.green() + (accent.green() - text.green()) * t),
+                round(text.blue() + (accent.blue() - text.blue()) * t),
+            )
+            path = QPainterPath()
+            path.moveTo(cx - half_w, cy - half_h)
+            path.lineTo(cx + half_w, cy)
+            path.lineTo(cx - half_w, cy + half_h)
+            pen = QPen(color, stroke_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.strokePath(path, pen)
+
         painter.end()
         return QIcon(pixmap)
 

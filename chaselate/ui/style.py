@@ -11,6 +11,7 @@ with no widget touched individually.
 
 from __future__ import annotations
 
+import re
 from typing import Dict
 
 from ..config import UiConfig
@@ -65,6 +66,31 @@ LIGHT: Dict[str, str] = {
 
 def palette(theme: str) -> Dict[str, str]:
     return LIGHT if str(theme).strip().lower() == "light" else DARK
+
+
+_RGBA_RE = re.compile(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
+
+
+def qcolor(spec: str):
+    """A palette entry as a real ``QColor``, not just a QSS string.
+
+    Every colour here is written as a QSS literal -- ``"#6fd0ff"`` or, for anything
+    translucent, the CSS function form ``"rgba(r, g, b, a)"`` -- because that is what
+    stylesheets need. Qt's QSS engine parses both forms; the plain ``QColor(str)``
+    constructor Python code reaches for does not understand the ``rgba(...)`` form at all,
+    and silently returns an *invalid* (opaque black) colour instead of raising -- confirmed
+    the hard way when a light-theme tray icon rendered with a black background because its
+    "plate" colour is exactly this rgba() form. Anything drawing with ``QPainter`` (the
+    generated exe/tray icons; anything else that needs an actual QColor rather than a
+    stylesheet fragment) should go through this rather than ``QColor(spec)`` directly.
+    """
+    from PyQt5.QtGui import QColor  # local: keeps this module importable without PyQt5
+
+    match = _RGBA_RE.fullmatch(spec.strip())
+    if match:
+        r, g, b, a = match.groups()
+        return QColor(int(r), int(g), int(b), int(a) if a is not None else 255)
+    return QColor(spec)
 
 
 def _clamp(value: int, low: int, high: int) -> int:

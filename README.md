@@ -34,6 +34,16 @@ output device directly, so Chaselate just records the speakers.
 
 ## Install
 
+**Prebuilt installer** (no Python needed): download `ChaselateSetup-<version>.exe` from
+[Releases](https://github.com/dockvader/Chaselate/releases) and run it. Installs per-user
+(no admin prompt), shows up in Settings > Apps for uninstalling, and offers GPU support as
+an optional component during setup. Not code-signed, so Windows SmartScreen will ask for
+confirmation the first time — see `packaging/README.md` for why. Ollama still needs to be
+installed separately either way; the installer checks for it and offers to open the download
+page if it's missing or out of date.
+
+**From source:**
+
 ```bat
 setup.bat
 ```
@@ -44,6 +54,9 @@ default translation model. Then:
 ```bat
 run.bat
 ```
+
+Building the installer yourself — `packaging/README.md` has the full process (PyInstaller
+freeze + NSIS).
 
 Doing it by hand instead:
 
