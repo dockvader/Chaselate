@@ -48,9 +48,16 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal  # noqa: E402
 from .asr import AsrError, WhisperEngine  # noqa: E402
 from .audio import AudioCapture
 from .audio.devices import DeviceInfo
-from .config import AppConfig
+from .config import AppConfig, AsrConfig
 from .languages import AUTO
-from .textutils import dedupe_overlap, normalize_ws, split_sentences
+from .textutils import (
+    dedupe_overlap,
+    extend_hint,
+    join_text,
+    longest_common_prefix,
+    normalize_ws,
+    split_sentences,
+)
 from .translate import (
     ContextPair,
     OllamaClient,
@@ -73,8 +80,62 @@ ASR_QUEUE_MAX = 12
 TRANSLATE_QUEUE_MAX = 16
 #: How often the metrics signal fires, in milliseconds.
 METRICS_INTERVAL_MS = 1000
+#: How much recently-*committed* text primes the next Whisper call, in tokens (see
+#: textutils.extend_hint) -- matches the budget Whisper-Streaming's LocalAgreement paper
+#: found effective for the same "last N words as prompt" trick.
+PROMPT_HINT_MAX_TOKENS = 200
+#: LocalAgreement-2 commit policy (Whisper-Streaming / Macháček et al. 2023), adapted to
+#: Chaselate's VAD-gated segment thread instead of the paper's fixed re-transcription timer:
+#: a silence-closed segment does not, by itself, mean the sentence is finished -- languages
+#: with frequent short clause-pauses (Japanese in particular) trip the VAD well before a
+#: sentence is actually done. So instead of trusting a single pass, an uncommitted utterance's
+#: audio is accumulated across silence-closed segments and RE-transcribed as a whole each
+#: time; only the text that agrees between this pass and the previous one over the same
+#: (still growing) audio is trusted and shown (see textutils.longest_common_prefix). This
+#: means a single pause no longer needs to be long enough to be trustworthy on its own -- a
+#: premature guess is just held and revised, not wrongly finalised -- so min_silence_ms can go
+#: back down for snappier re-checks without reintroducing fragmentation.
+#: Never held past this much accumulated audio, win or lose, both as a compute cap (this is
+#: genuinely more expensive than transcribing each segment once -- the buffer gets
+#: re-transcribed from scratch on every pass) and so a stretch of speech that Whisper simply
+#: never settles on is not withheld forever.
+HOLD_MAX_SECONDS = 16.0
+#: If the hold buffer's last pass already reads as a clean, complete sentence but no further
+#: speech arrives to trigger the usual confirming second pass, trust it anyway after this
+#: much idle time (checked from _asr_loop's own ~200ms idle poll -- see _finalize_stale_hold)
+#: rather than make the last sentence before a pause wait for HOLD_MAX_SECONDS.
+HOLD_TERMINATOR_CONFIRM_S = 1.5
+#: Cheap path (see _transcribe_cheap) for engines whose own architecture is not prone to
+#: Whisper's specific "confident wrong guess on truncated audio" failure mode (see
+#: VoxtralEngine.NEEDS_AUDIO_REVERIFY) -- the LocalAgreement hold-buffer path above
+#: re-transcribes the whole growing buffer on every new segment, which costs O(segments^2)
+#: and is only affordable because faster-whisper is fast enough to absorb it; Voxtral's
+#: real-time-ish throughput cannot, and testing showed a live session's captions falling
+#: further and further behind (see CLAUDE.md). This is the older, cheaper, single-pass-per-
+#: segment design (transcribe once, text-carry an unterminated remainder across a bounded
+#: number of held silences) that predates the LocalAgreement rewrite.
+CHEAP_MAX_SILENCE_HOLDS = 2
 
 _SENTINEL = object()
+#: Queued like a normal item so it lands in order relative to already-queued utterances,
+#: rather than mutating _context directly from the GUI thread -- see clear_context().
+_CLEAR_CONTEXT = object()
+
+
+def _make_asr_engine(cfg: AsrConfig):
+    """Pick the ASR engine class named by ``cfg.engine``.
+
+    Chosen once at Pipeline construction time, not re-evaluated on config changes -- see
+    apply_config's ``self._engine.config = config.asr`` reassignment, which updates settings
+    on the already-chosen engine instance rather than swapping the class. Switching between
+    "whisper" and "voxtral" (experimental -- see chaselate/voxtral_engine.py) needs an app
+    restart, which is an acceptable limitation for an experiment/voxtral-asr branch spike.
+    """
+    if cfg.engine == "voxtral":
+        from .voxtral_engine import VoxtralEngine
+
+        return VoxtralEngine(cfg)
+    return WhisperEngine(cfg)
 
 
 @dataclass
@@ -135,13 +196,27 @@ class Pipeline(QObject):
         self._asr_queue: "queue.Queue" = queue.Queue()
         self._translate_queue: "queue.Queue" = queue.Queue()
 
-        self._engine = WhisperEngine(config.asr)
+        self._engine = _make_asr_engine(config.asr)
         self._ollama = OllamaClient(config.translate)
         self._segmenter = Segmenter(config.vad)
 
         # Assembly state, touched only by the ASR thread.
-        self._pending_text = ""
-        self._previous_text = ""
+        self._previous_text = ""  # last raw transcription, for the maxlen-overlap dedup path
+        self._prompt_hint = ""  # recently-committed text, primes the next Whisper call
+        # LocalAgreement hold buffer: raw audio not yet committed, its last pass's full
+        # transcription (for prefix agreement against the next pass), how much of that text
+        # has already been committed/shown (so a later pass only emits the delta), and enough
+        # of the last pass's bookkeeping (segment, Transcript) for _finalize_stale_hold to
+        # commit from without needing to call Whisper again.
+        self._hold_audio: List[np.ndarray] = []
+        self._hold_prev_text = ""
+        self._hold_committed = ""
+        self._hold_last_pass_at = 0.0
+        self._hold_last_segment: Optional[Segment] = None
+        self._hold_last_result = None
+        # Cheap path (see _transcribe_cheap): text-only pending remainder + hold counter.
+        self._cheap_pending_text = ""
+        self._cheap_silence_holds = 0
         self._next_id = 1
 
         # Context for the translator, touched only by the translate thread.
@@ -192,8 +267,16 @@ class Pipeline(QObject):
         self._engine.config = cfg.asr
         self._ollama.config = cfg.translate
         self._segmenter = Segmenter(cfg.vad, self._segmenter.vad)
-        self._pending_text = ""
         self._previous_text = ""
+        self._prompt_hint = ""
+        self._hold_audio = []
+        self._hold_prev_text = ""
+        self._hold_committed = ""
+        self._hold_last_pass_at = 0.0
+        self._hold_last_segment = None
+        self._hold_last_result = None
+        self._cheap_pending_text = ""
+        self._cheap_silence_holds = 0
         self._context.clear()
         self._dropped_audio = self._dropped_segments = self._dropped_sentences = 0
         self._asr_count = 0
@@ -275,6 +358,21 @@ class Pipeline(QObject):
         self.stop()
         self._engine.unload()
         self._ollama.close()
+
+    def clear_context(self) -> None:
+        """Drop the translator's rolling context of recent sentence pairs.
+
+        Call this whenever the visible caption history is wiped (see
+        OverlayWindow.clear_captions), so a translation made right afterwards does not pull
+        pronouns/continuity from utterances the user can no longer see. _context is otherwise
+        touched only by the translate thread (see its declaration), so this enqueues a marker
+        for that thread to act on rather than mutating it directly from the GUI thread -- it
+        also keeps ordering correct relative to any utterance already queued ahead of it.
+        """
+        try:
+            self._translate_queue.put_nowait(_CLEAR_CONTEXT)
+        except queue.Full:
+            log.debug("translate queue full, dropping clear-context request")
 
     def apply_config(self, config: AppConfig) -> bool:
         """Adopt new settings. Returns True if a restart was needed to apply them.
@@ -443,6 +541,10 @@ class Pipeline(QObject):
             try:
                 item = asr_q.get(timeout=0.2)
             except queue.Empty:
+                try:
+                    self._finalize_stale_hold(translate_q)
+                except Exception:  # noqa: BLE001
+                    log.exception("stale-hold finalize failed")
                 continue
             if item is _SENTINEL:
                 break
@@ -456,7 +558,140 @@ class Pipeline(QObject):
                 self.error.emit(f"Recognition failed: {exc}")
 
     def _transcribe(self, segment: Segment, translate_q: "queue.Queue") -> None:
-        result = self._engine.transcribe(segment.audio, self.config.asr.source_lang)
+        # Engines that do not need Whisper-specific audio-level re-verification (see
+        # CHEAP_MAX_SILENCE_HOLDS) take the cheaper single-pass path instead of the
+        # LocalAgreement hold buffer below, which would re-transcribe their whole growing
+        # buffer on every segment -- a cost only faster-whisper's speed can absorb.
+        if not getattr(self._engine, "NEEDS_AUDIO_REVERIFY", True):
+            self._transcribe_cheap(segment, translate_q)
+            return
+
+        if segment.continues_previous:
+            # A forced mid-speech (maxlen) cut, not a pause -- unrelated to the LocalAgreement
+            # hold buffer below, which only ever grows across genuine *silence* closures. If a
+            # hold was in progress when this fires (a short pause followed by 14+ seconds of
+            # completely unbroken speech), finalise whatever it had agreed on so far first --
+            # precisely trimming this segment's deliberate audio-sample overlap (see vad.py)
+            # out of a growing buffer needs word-level timestamps Chaselate does not currently
+            # request, so rather than risk a subtly wrong trim, this segment stays on the
+            # older, already-proven single-segment + text-level dedupe_overlap path instead.
+            if self._hold_audio:
+                self._hold_pass(segment, translate_q, must_finalize=True)
+            self._transcribe_continuation(segment, translate_q)
+            return
+
+        self._hold_audio.append(segment.audio)
+        self._hold_pass(segment, translate_q, must_finalize=(segment.reason == "flush"))
+
+    def _hold_pass(self, segment: Segment, translate_q: "queue.Queue", must_finalize: bool) -> None:
+        """Re-transcribe the whole hold buffer and commit whatever now reaches LocalAgreement
+        (or, if ``must_finalize``, whatever this single pass says outright).
+
+        Only text that AGREES between this pass and the previous one over the same, still-
+        growing audio is trusted -- an ASR model's read of an as-yet-incomplete utterance can
+        (and does) change once it hears more of it, so a single pass guessing a plausible-
+        looking terminator too early is exactly the failure this exists to catch, not just
+        the "chopped fragment" bug that motivated it.
+        """
+        combined_audio = (
+            self._hold_audio[0] if len(self._hold_audio) == 1 else np.concatenate(self._hold_audio)
+        )
+        result = self._engine.transcribe(
+            combined_audio, self.config.asr.source_lang, prompt_hint=self._prompt_hint
+        )
+        self._hold_last_pass_at = time.monotonic()
+        self._hold_last_segment = segment
+        self._hold_last_result = result
+        self._asr_count += 1
+        self._asr_time += result.elapsed
+        self._asr_audio += result.duration
+
+        hold_seconds = combined_audio.size / float(SAMPLE_RATE)
+        must_finalize = must_finalize or hold_seconds >= HOLD_MAX_SECONDS
+
+        if result.empty:
+            if must_finalize:
+                self._reset_hold()
+            return
+
+        text = result.text
+        if must_finalize:
+            # Nothing more is coming (capture stopped, a maxlen cut is about to take over, or
+            # we've simply waited long enough): trust this pass outright rather than wait for
+            # a confirming one that is not coming.
+            agreed = text
+        else:
+            agreed = (
+                longest_common_prefix(self._hold_prev_text, text, result.language)
+                if self._hold_prev_text
+                else ""
+            )
+        self._hold_prev_text = text
+
+        new_agreed = agreed[len(self._hold_committed):] if agreed.startswith(self._hold_committed) else agreed
+        if not new_agreed:
+            return  # nothing new settled yet; wait for more audio (or the finalize deadline)
+
+        sentences, remainder = split_sentences(new_agreed, result.language)
+        if must_finalize and remainder:
+            sentences.append(remainder)
+            remainder = ""
+
+        for sentence in sentences:
+            self._commit_sentence(sentence, segment, result, translate_q)
+        self._hold_committed = agreed[: len(agreed) - len(remainder)] if remainder else agreed
+
+        if must_finalize or not remainder:
+            self._reset_hold()
+
+    def _finalize_stale_hold(self, translate_q: "queue.Queue") -> None:
+        """Idle-poll backstop (called from _asr_loop's queue.Empty branch, so roughly every
+        200 ms of silence): if the hold buffer's last pass already read as a clean, complete
+        sentence but never got the usual confirming second pass -- because no further speech
+        arrived to trigger one -- trust it anyway after a short, separate wait.
+
+        Without this, the *last* sentence before an ordinary conversational lull would sit
+        unshown until either someone speaks again (triggering the next real pass) or the much
+        longer HOLD_MAX_SECONDS cap, which is a bad experience for something that was already
+        finished. A still-genuinely-incomplete remainder (mid-sentence, no terminator) is left
+        alone here -- HOLD_MAX_SECONDS is the only backstop for that case, on purpose, since
+        there is no terminator to trust in the first place.
+        """
+        if not self._hold_audio or not self._hold_prev_text or self._hold_last_segment is None:
+            return
+        if time.monotonic() - self._hold_last_pass_at < HOLD_TERMINATOR_CONFIRM_S:
+            return
+        _, remainder = split_sentences(self._hold_prev_text, self._hold_last_result.language)
+        if remainder:
+            return
+
+        new_agreed = (
+            self._hold_prev_text[len(self._hold_committed):]
+            if self._hold_prev_text.startswith(self._hold_committed)
+            else self._hold_prev_text
+        )
+        if not new_agreed:
+            return
+        sentences, _ = split_sentences(new_agreed, self._hold_last_result.language)
+        for sentence in sentences:
+            self._commit_sentence(sentence, self._hold_last_segment, self._hold_last_result, translate_q)
+        self._reset_hold()
+
+    def _reset_hold(self) -> None:
+        self._hold_audio = []
+        self._hold_prev_text = ""
+        self._hold_committed = ""
+        self._hold_last_segment = None
+        self._hold_last_result = None
+
+    def _transcribe_continuation(self, segment: Segment, translate_q: "queue.Queue") -> None:
+        """The maxlen/continues_previous path: transcribe this segment alone and dedupe its
+        deliberate audio-sample overlap with the previous one at the text level (proven,
+        pre-existing machinery -- see module docstring / vad.py's own comments on why the
+        overlap exists)."""
+        result = self._engine.transcribe(
+            segment.audio, self.config.asr.source_lang, prompt_hint=self._prompt_hint
+        )
         self._asr_count += 1
         self._asr_time += result.elapsed
         self._asr_audio += result.duration
@@ -464,28 +699,74 @@ class Pipeline(QObject):
             return
 
         text = result.text
-        # Forced mid-speech cuts overlap the previous segment on purpose; strip the repeat.
+        if self._previous_text:
+            text = dedupe_overlap(self._previous_text, text, result.language)
+            if not text:
+                return
+        self._previous_text = result.text
+
+        sentences, remainder = split_sentences(text, result.language)
+        if remainder:
+            sentences.append(remainder)
+        for sentence in sentences:
+            self._commit_sentence(sentence, segment, result, translate_q)
+
+    def _transcribe_cheap(self, segment: Segment, translate_q: "queue.Queue") -> None:
+        """Single-pass-per-segment path for engines that set ``NEEDS_AUDIO_REVERIFY = False``
+        (see VoxtralEngine). Transcribes this segment's own audio exactly once -- no
+        re-transcribing a growing buffer -- and text-carries an unterminated remainder across
+        a bounded number of held silences (CHEAP_MAX_SILENCE_HOLDS), the same policy the
+        LocalAgreement hold buffer's must_finalize path uses, just without the audio-level
+        cross-pass verification that policy does not need here.
+        """
+        result = self._engine.transcribe(
+            segment.audio, self.config.asr.source_lang, prompt_hint=self._prompt_hint
+        )
+        self._asr_count += 1
+        self._asr_time += result.elapsed
+        self._asr_audio += result.duration
+        if result.empty:
+            return
+
+        text = result.text
         if segment.continues_previous and self._previous_text:
             text = dedupe_overlap(self._previous_text, text, result.language)
             if not text:
                 return
         self._previous_text = result.text
 
-        combined = normalize_ws(" ".join(p for p in (self._pending_text, text) if p))
+        combined = normalize_ws(
+            join_text([p for p in (self._cheap_pending_text, text) if p], result.language)
+        )
         sentences, remainder = split_sentences(combined, result.language)
 
-        # A real pause is a sentence boundary even without punctuation, so flush the tail.
-        if segment.reason in ("silence", "flush") and remainder:
-            sentences.append(remainder)
-            remainder = ""
-        self._pending_text = remainder
+        if segment.reason == "flush":
+            if remainder:
+                sentences.append(remainder)
+                remainder = ""
+        elif segment.reason == "silence" and remainder:
+            self._cheap_silence_holds += 1
+            if self._cheap_silence_holds > CHEAP_MAX_SILENCE_HOLDS:
+                sentences.append(remainder)
+                remainder = ""
+
+        if not remainder:
+            self._cheap_silence_holds = 0
+        self._cheap_pending_text = remainder
 
         for sentence in sentences:
-            self._emit_utterance(sentence, segment, result, translate_q)
+            self._commit_sentence(sentence, segment, result, translate_q)
 
-    def _emit_utterance(
+    def _commit_sentence(
         self, sentence: str, segment: Segment, result, translate_q: "queue.Queue"
     ) -> None:
+        """A sentence has been decided -- LocalAgreement-confirmed, or the maxlen/flush
+        fallback path's single pass. Only text that reaches this point primes the next
+        Whisper call's prompt hint (see PROMPT_HINT_MAX_TOKENS); a still-provisional pass
+        that has not agreed with anything yet must not leak into it."""
+        self._prompt_hint = extend_hint(
+            self._prompt_hint, sentence, PROMPT_HINT_MAX_TOKENS, result.language
+        )
         utterance = Utterance(
             id=self._next_id,
             original=sentence,
@@ -526,6 +807,9 @@ class Pipeline(QObject):
                 continue
             if item is _SENTINEL:
                 break
+            if item is _CLEAR_CONTEXT:
+                self._context.clear()
+                continue
             self._translate_one(item, stop)
 
     def _translate_one(self, utterance: Utterance, stop: threading.Event) -> None:

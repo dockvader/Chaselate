@@ -14,10 +14,13 @@ Two things drive most of the structure here:
 
 from __future__ import annotations
 
+import html
 import logging
+import os
+from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from PyQt5.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QRect, QSize, QStandardPaths, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QCursor,
@@ -30,10 +33,13 @@ from PyQt5.QtGui import (
     QPen,
     QPixmap,
     QRadialGradient,
+    QTextDocument,
 )
+from PyQt5.QtPrintSupport import QPrinter
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -311,6 +317,14 @@ class OverlayWindow(QWidget):
         self.lang_combo = self._build_lang_combo(bar)
         row.addWidget(self.lang_combo)
 
+        self.clear_button = self._icon_button(bar, "Clear", "Clear all captions (Ctrl+L)")
+        self.clear_button.clicked.connect(self.clear_captions)
+        row.addWidget(self.clear_button)
+
+        self.export_button = self._icon_button(bar, "PDF", "Export captions as PDF (Ctrl+E)")
+        self.export_button.clicked.connect(self.export_pdf)
+        row.addWidget(self.export_button)
+
         self.settings_button = self._icon_button(bar, "⚙", "Settings (Ctrl+,)")
         self.settings_button.clicked.connect(self.open_settings)
         row.addWidget(self.settings_button)
@@ -501,6 +515,8 @@ class OverlayWindow(QWidget):
             ("Esc", self.hide_to_tray),
             ("Ctrl+Q", self.quit),
             ("Ctrl+C", self.copy_captions),
+            ("Ctrl+L", self.clear_captions),
+            ("Ctrl+E", self.export_pdf),
             ("Ctrl++", lambda: self.adjust_font(1)),
             ("Ctrl+=", lambda: self.adjust_font(1)),
             ("Ctrl+Shift+=", lambda: self.adjust_font(1)),
@@ -1172,6 +1188,91 @@ class OverlayWindow(QWidget):
         QGuiApplication.clipboard().setText(text)
         if text:
             self.tray.setToolTip(f"{APP_NAME} - captions copied")
+
+    def clear_captions(self) -> None:
+        """Wipe the caption history and the translator's rolling context in one action.
+
+        One click, no confirmation dialog: captions are ephemeral live subtitles, not saved
+        work, and a confirmation prompt would defeat the point of "clear it and keep
+        watching". The translator's own sentence-pair context is flushed too (see
+        Pipeline.clear_context) so a translation made right after does not quietly drag in
+        continuity from captions the user just erased.
+        """
+        if not self._order:
+            return
+        self._cancel_scroll_chase()
+        for block in self._blocks.values():
+            block.setParent(None)
+            block.deleteLater()
+        self._blocks.clear()
+        self._order.clear()
+        self._active_uid = None
+        self.placeholder.setVisible(True)
+        self._auto_follow = True
+        self._defer_canvas_height_sync()
+        self._update_jump_pill()
+        self.pipeline.clear_context()
+
+    def export_pdf(self) -> None:
+        """Save the visible caption history to a PDF, oldest first, same order shown on screen."""
+        if not self._order:
+            self.show_banner("No captions to export yet.")
+            return
+
+        default_dir = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        default_name = f"{APP_NAME}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
+        default_path = os.path.join(default_dir or os.path.expanduser("~"), default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export captions as PDF", default_path, "PDF files (*.pdf)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(self._captions_html())
+
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(path)
+        printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+        doc.print_(printer)
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            self.tray.setToolTip(f"{APP_NAME} - exported {os.path.basename(path)}")
+        else:
+            self.show_banner(f"Could not write {path}")
+
+    def _captions_html(self) -> str:
+        # Fixed, print-friendly colours rather than the on-screen theme palette: a PDF is read
+        # on white paper regardless of whether the overlay itself is in dark or light mode.
+        rows = []
+        for uid in self._order:
+            block = self._blocks.get(uid)
+            if block is None:
+                continue
+            utterance = block.utterance
+            when = datetime.fromtimestamp(utterance.created_at).strftime("%H:%M:%S")
+            rows.append(
+                "<div style='margin-bottom:14px;'>"
+                f"<div style='color:#777777; font-size:9pt;'>{when}</div>"
+                f"<div style='font-size:11pt; color:#111111;'>{html.escape(utterance.original)}</div>"
+                + (
+                    f"<div style='font-size:11pt; color:#0b5fa5;'>"
+                    f"{html.escape(utterance.translation)}</div>"
+                    if utterance.translation
+                    else ""
+                )
+                + "</div>"
+            )
+        title = (
+            f"<h2 style='margin-bottom:6px;'>{html.escape(APP_NAME)} transcript</h2>"
+            f"<div style='color:#777777; font-size:9pt; margin-bottom:18px;'>"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}</div>"
+        )
+        return title + "".join(rows)
 
     def set_click_through(self, enabled: bool) -> None:
         self.config.ui.mouse_transparent = bool(enabled)

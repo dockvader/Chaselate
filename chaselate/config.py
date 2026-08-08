@@ -68,8 +68,14 @@ class VadConfig:
     #: Silero speech probability above which a frame counts as speech.
     threshold: float = 0.5
     min_speech_ms: int = 250
-    #: Trailing silence that closes a segment. Lower = snappier but choppier.
-    min_silence_ms: int = 300
+    #: Trailing silence that closes a segment. Lower = snappier but choppier -- and every
+    #: closure force-flushes whatever text is pending as a "sentence" even without a
+    #: terminator (see pipeline.py's _process_asr_result), so too low a value here reads as
+    #: fragmented, disconnected captions rather than just choppy timing. 300ms undercuts the
+    #: length of an ordinary clause-boundary pause in continuous speech (Japanese especially,
+    #: with its short pauses after は/けど/、); 500ms leaves more room for a real sentence to
+    #: finish before being cut.
+    min_silence_ms: int = 500
     #: Audio kept either side of detected speech so consonants are not clipped.
     speech_pad_ms: int = 200
     #: Hard cut for someone who never pauses, so captions keep flowing.
@@ -98,6 +104,21 @@ class AsrConfig:
     cpu_threads: int = 0
     initial_prompt: str = ""
 
+    # -- experimental: Voxtral Realtime engine (see chaselate/voxtral_engine.py) -----------
+    # Not a shipped feature -- an experiment/voxtral-asr branch spike to try Voxtral Realtime
+    # (Mistral, Apache 2.0, native streaming architecture) as a drop-in replacement for
+    # faster-whisper, evaluated after finding a real CUDA crash bug in the upstream project
+    # (voxtral.cpp issue #4) and hand-patching it locally. See CLAUDE.md for the full story.
+    #: "whisper" (default, production) or "voxtral" (experimental).
+    engine: str = "whisper"
+    #: Path to the patched voxtral.exe build (see CLAUDE.md for how it was built/patched).
+    voxtral_exe: str = r"C:\voxtral\bin\voxtral.exe"
+    voxtral_model: str = r"C:\voxtral\models\Q4_K_M.gguf"
+    #: CUDA Toolkit's runtime DLL directory -- voxtral.exe needs this on PATH to find
+    #: cudart64_13.dll/cublas64_13.dll (CUDA 13.x moved these into bin\x64, not bin).
+    voxtral_cuda_bin: str = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"
+    voxtral_gpu: str = "cuda"
+
 
 @dataclass
 class TranslateConfig:
@@ -105,8 +126,10 @@ class TranslateConfig:
     base_url: str = "http://127.0.0.1:11434"
     model: str = "translategemma:latest"
     target_lang: str = "zh-TW"
-    #: Previous sentence pairs given to the model as context. 0 disables context.
-    context_sentences: int = 2
+    #: Previous sentence pairs given to the model as context. 0 disables context. Higher
+    #: helps languages that drop pronouns/subjects (Japanese in particular) read as a
+    #: continuous conversation instead of isolated, disconnected lines.
+    context_sentences: int = 5
     temperature: float = 0.2
     num_predict: int = 512
     #: Passed to Ollama's keep_alive so the model is not evicted between utterances.

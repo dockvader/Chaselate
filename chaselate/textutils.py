@@ -31,6 +31,8 @@ __all__ = [
     "clean_translation",
     "join_text",
     "truncate_middle",
+    "extend_hint",
+    "longest_common_prefix",
 ]
 
 _WS_RE = re.compile(r"\s+")
@@ -142,6 +144,26 @@ def tokenize(text: str, lang: Optional[str] = None) -> List[str]:
     return _split(text, _resolve_spaceless(text, lang))
 
 
+def extend_hint(hint: str, addition: str, limit: int, lang: Optional[str] = None) -> str:
+    """Append ``addition`` to a rolling ``hint``, kept to its trailing ``limit`` tokens.
+
+    Built for feeding Whisper's ``initial_prompt`` with recently recognised speech so
+    terminology and phrasing stay consistent across segments -- the "last N words as prompt"
+    trick from Whisper-Streaming's LocalAgreement paper (Macháček et al. 2023). Tokens are
+    words for spaced scripts and characters for spaceless ones (see :func:`tokenize`), so the
+    same numeric budget is a comparable amount of context regardless of script.
+    """
+    if limit <= 0:
+        return ""
+    combined = normalize_ws(f"{hint} {addition}" if hint else addition)
+    if not combined:
+        return ""
+    tokens = tokenize(combined, lang)
+    if len(tokens) > limit:
+        tokens = tokens[-limit:]
+    return join_text(tokens, lang)
+
+
 def join_text(tokens: Sequence[str], lang: Optional[str] = None) -> str:
     """Inverse of :func:`tokenize` for the token style that language uses.
 
@@ -156,6 +178,25 @@ def join_text(tokens: Sequence[str], lang: Optional[str] = None) -> str:
         if _get_lang(lang) is not None:
             return _join(tokens, is_spaceless(lang))
     return _join(tokens, all(len(t) == 1 for t in tokens))
+
+
+def longest_common_prefix(a: str, b: str, lang: Optional[str] = None) -> str:
+    """Longest run of leading tokens shared by ``a`` and ``b``.
+
+    This is LocalAgreement-2's commit rule (Whisper-Streaming / Macháček et al. 2023):
+    re-transcribing the same, still-growing audio twice in a row and keeping only the prefix
+    both passes agree on is a far more reliable "is this settled yet" signal than trusting a
+    single pass, or a fixed pause length, blindly. Comparison is on folded tokens (see
+    :func:`dedupe_overlap`), so case/accent differences between passes do not break agreement.
+    """
+    tokens_a = tokenize(a, lang)
+    tokens_b = tokenize(b, lang)
+    n = 0
+    for ta, tb in zip(tokens_a, tokens_b):
+        if _fold(ta) != _fold(tb):
+            break
+        n += 1
+    return join_text(tokens_a[:n], lang)
 
 
 def dedupe_overlap(

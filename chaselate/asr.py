@@ -367,12 +367,20 @@ class WhisperEngine:
 
     # -- transcription -----------------------------------------------------
 
-    def transcribe(self, audio: np.ndarray, language: Optional[str] = None) -> Transcript:
+    def transcribe(
+        self, audio: np.ndarray, language: Optional[str] = None, prompt_hint: str = ""
+    ) -> Transcript:
         """Transcribe 16 kHz mono float32 audio.
 
         ``language`` overrides the configured source language; ``None``/``auto`` lets
         Whisper detect. Confidence filtering and hallucination rejection are applied, so an
         empty ``text`` means "nothing worth showing", not necessarily an error.
+
+        ``prompt_hint`` is recently recognised text (see Pipeline._transcribe / textutils.
+        extend_hint) appended after the user's own configured ``initial_prompt``, so Whisper
+        starts each segment primed with what was just said -- the "last N words as prompt"
+        trick from Whisper-Streaming's LocalAgreement paper, which keeps terminology and
+        phrasing consistent across segments instead of each one being decoded cold.
         """
         audio = np.ascontiguousarray(audio, dtype=np.float32).reshape(-1)
         duration = audio.size / float(SAMPLE_RATE)
@@ -382,6 +390,7 @@ class WhisperEngine:
         self.load()
         cfg = self.config
         lang_code = whisper_code(language if language is not None else cfg.source_lang)
+        prompt = " ".join(p for p in (cfg.initial_prompt.strip(), prompt_hint.strip()) if p)
 
         started = time.time()
         try:
@@ -392,7 +401,7 @@ class WhisperEngine:
                     beam_size=max(1, int(cfg.beam_size)),
                     vad_filter=bool(cfg.vad_filter),
                     condition_on_previous_text=bool(cfg.condition_on_previous_text),
-                    initial_prompt=cfg.initial_prompt or None,
+                    initial_prompt=prompt or None,
                     word_timestamps=False,
                 )
                 collected = list(segments)

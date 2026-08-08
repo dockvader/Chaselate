@@ -6,8 +6,10 @@ from chaselate.textutils import (
     clean_translation,
     collapse_repeats,
     dedupe_overlap,
+    extend_hint,
     is_hallucination,
     join_text,
+    longest_common_prefix,
     normalize_ws,
     split_sentences,
     tokenize,
@@ -88,6 +90,72 @@ def test_join_text_inverse_of_tokenize_for_chinese():
 
 def test_join_text_empty_tokens_returns_empty():
     assert join_text([]) == ""
+
+
+# -- extend_hint --------------------------------------------------------
+
+def test_extend_hint_starts_from_empty():
+    assert extend_hint("", "hello world", limit=10) == "hello world"
+
+
+def test_extend_hint_appends_and_keeps_trailing_tokens_english():
+    hint = extend_hint("hello world this is", "a test of the hint budget", limit=6)
+    assert hint == "a test of the hint budget"
+
+
+def test_extend_hint_keeps_trailing_characters_for_cjk():
+    # 12 kana; only the trailing 5 characters should survive.
+    hint = extend_hint("", "きょうはいいてんきですね", limit=5, lang="ja")
+    assert hint == "んきですね"
+
+
+def test_extend_hint_accumulates_across_calls_like_a_rolling_window():
+    hint = extend_hint("", "one two three", limit=5)
+    hint = extend_hint(hint, "four five six", limit=5)
+    # Only the most recent 5 tokens survive the second call.
+    assert tokenize(hint) == ["two", "three", "four", "five", "six"]
+
+
+def test_extend_hint_limit_zero_disables_it():
+    assert extend_hint("anything pending", "more text", limit=0) == ""
+
+
+def test_extend_hint_empty_addition_returns_existing_hint_trimmed():
+    # lang="en" avoids join_text's single-char-token spaceless ambiguity (see
+    # test_tokenize_single_char_words_not_glued_together above), same as real callers always
+    # pass the ASR-detected language rather than leaving it to be sniffed.
+    assert extend_hint("a b c", "", limit=2, lang="en") == "b c"
+
+
+# -- longest_common_prefix ---------------------------------------------------
+
+def test_longest_common_prefix_full_agreement():
+    assert longest_common_prefix("the cat sat down", "the cat sat down", lang="en") == "the cat sat down"
+
+
+def test_longest_common_prefix_partial_agreement_stops_at_first_divergence():
+    # Second pass over a growing buffer heard more and revised the tail.
+    a = "i think the meeting"
+    b = "i think the meeting is"
+    assert longest_common_prefix(a, b, lang="en") == "i think the meeting"
+
+
+def test_longest_common_prefix_diverges_immediately_returns_empty():
+    assert longest_common_prefix("hello there", "goodbye now", lang="en") == ""
+
+
+def test_longest_common_prefix_no_prior_pass_is_empty_string():
+    assert longest_common_prefix("", "anything at all", lang="en") == ""
+
+
+def test_longest_common_prefix_case_insensitive_like_dedupe_overlap():
+    assert longest_common_prefix("The Cat Sat", "the cat sat down", lang="en") == "The Cat Sat"
+
+
+def test_longest_common_prefix_cjk_characters():
+    a = "きょうは会議があるので"
+    b = "きょうは会議があるので準備をします"
+    assert longest_common_prefix(a, b, lang="ja") == "きょうは会議があるので"
 
 
 # -- dedupe_overlap ---------------------------------------------------------

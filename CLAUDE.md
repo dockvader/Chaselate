@@ -82,6 +82,17 @@ Windows 版即時語音翻譯字幕條。移植自 macOS 的 KazKozDev/live-tran
   整數比例（48k→16k）每個區塊都會踩到，不要「簡化」掉。
 - **`pipeline.py` 的四執行緒/佇列結構**：音訊 callback 裡只能 `put_nowait`。
   把 VAD 或 ASR 搬進 callback 會讓 WASAPI 掉樣本（爆音）。
+- **`pipeline.py` 的斷句用 LocalAgreement-2**（`_hold_pass`/`_finalize_stale_hold`/
+  `longest_common_prefix`，抄 Whisper-Streaming 論文 Macháček et al. 2023）：VAD 靜音關閉
+  段落不等於「這句話講完了」，會把未確認的音訊累積進 `_hold_audio`、整段重轉錄，只有跟上一輪
+  轉錄結果**一致的前綴**才會顯示——單看一輪、猜錯終結符號的風險比只是斷句斷太早更值得防。
+  代價是同一段音訊會被 Whisper 轉錄好幾次（`HOLD_MAX_SECONDS=16` 是上限保底）。已知限制：
+  hold 進行中若被 maxlen（14 秒不間斷語音）強制切斷，`_hold_pass` 會用 `must_finalize=True`
+  單輪信任了事，不會等到跟下一輪一致——這是刻意的簡化（要精準裁切重疊音訊需要 word-level
+  timestamps，這裡沒開）。`_finalize_stale_hold` 是另一個保底：句子已經有終結符號、但沒有
+  下一段語音可以確認一致時，等 `HOLD_TERMINATOR_CONFIRM_S=1.5s` 就直接信任，不然最後一句話
+  會卡到 16 秒才出現。改這塊前建議先看 `_hold_pass` 的完整 docstring 跟 pipeline.py 開頭的
+  模組常數註解。
 - **佇列滿時丟最舊**是刻意的（即時字幕要新不要全），不是 bug。丟棄有計數並回報到 metrics。
 - `.venv/`、`%APPDATA%\Chaselate\`（config 與 log）不進 git。
 
