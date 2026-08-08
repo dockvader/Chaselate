@@ -13,7 +13,7 @@
 ; Produces packaging\ChaselateSetup-<version>.exe.
 
 !define PRODUCT_NAME "Chaselate"
-!define PRODUCT_VERSION "0.1.0"
+!define PRODUCT_VERSION "0.2.0"
 !define PRODUCT_PUBLISHER "Chaselate"
 !define PRODUCT_WEB_SITE "https://github.com/dockvader/Chaselate"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
@@ -108,7 +108,10 @@ Section /o "GPU acceleration (CUDA, downloads ~1.9 GB)" SEC_CUDA
     SetOutPath "$INSTDIR"
     File "scripts\download_cuda.ps1"
 
-    DetailPrint "Downloading CUDA libraries from PyPI -- this can take a while..."
+    ; download_cuda.ps1 checks what's already installed first and skips the ~1.9 GB download
+    ; entirely if it's already current (e.g. on a reinstall/repair/upgrade), so this can be
+    ; either a long wait or near-instant -- its own [CUDA] log lines say which.
+    DetailPrint "Checking CUDA libraries..."
     nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\download_cuda.ps1" -InstallDir "$INSTDIR"'
     Pop $0
     Delete "$INSTDIR\download_cuda.ps1"

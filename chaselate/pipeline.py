@@ -75,6 +75,9 @@ TRANSLATE_QUEUE_MAX = 16
 METRICS_INTERVAL_MS = 1000
 
 _SENTINEL = object()
+#: Queued like a normal item so it lands in order relative to already-queued utterances,
+#: rather than mutating _context directly from the GUI thread -- see clear_context().
+_CLEAR_CONTEXT = object()
 
 
 @dataclass
@@ -275,6 +278,21 @@ class Pipeline(QObject):
         self.stop()
         self._engine.unload()
         self._ollama.close()
+
+    def clear_context(self) -> None:
+        """Drop the translator's rolling context of recent sentence pairs.
+
+        Call this whenever the visible caption history is wiped (see
+        OverlayWindow.clear_captions), so a translation made right afterwards does not pull
+        pronouns/continuity from utterances the user can no longer see. _context is otherwise
+        touched only by the translate thread, so this enqueues a marker for that thread to act
+        on rather than mutating it directly from the GUI thread -- it also keeps ordering
+        correct relative to any utterance already queued ahead of it.
+        """
+        try:
+            self._translate_queue.put_nowait(_CLEAR_CONTEXT)
+        except queue.Full:
+            log.debug("translate queue full, dropping clear-context request")
 
     def apply_config(self, config: AppConfig) -> bool:
         """Adopt new settings. Returns True if a restart was needed to apply them.
@@ -526,6 +544,9 @@ class Pipeline(QObject):
                 continue
             if item is _SENTINEL:
                 break
+            if item is _CLEAR_CONTEXT:
+                self._context.clear()
+                continue
             self._translate_one(item, stop)
 
     def _translate_one(self, utterance: Utterance, stop: threading.Event) -> None:

@@ -47,7 +47,7 @@ component in the installer downloads separately, on the target machine).
 | `chaselate.spec` | PyInstaller build spec. onedir mode, explicitly collects faster-whisper's bundled Silero VAD model and certifi's CA bundle (neither is visible to static import analysis), and **strips PyQt5's bundled MSVC runtime DLLs from the output** -- see the spec's own comment for why that one matters: without it, ctranslate2/onnxruntime fail with a DLL initialization error the first time either is used, not a normal crash. |
 | `run_chaselate.py` | Thin entry point PyInstaller actually analyzes (`python -m chaselate` isn't something PyInstaller can target directly). |
 | `installer.nsi` | The NSIS script: base install (required), optional CUDA component, post-install Ollama check, uninstaller. |
-| `scripts/download_cuda.ps1` | Run by the CUDA component. Downloads pinned `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` wheels from PyPI, extracts just the DLLs into `<install dir>\nvidia\...`. Failure here is non-fatal -- the app still runs on CPU. |
+| `scripts/download_cuda.ps1` | Run by the CUDA component. Resolves whichever version PyPI currently reports as *latest* for `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` (no version pin to maintain), extracts just the DLLs into `<install dir>\nvidia\...`. Compares against a small manifest (`nvidia\.chaselate_cuda_versions.json`) left by the last run and skips re-downloading (~1.9 GB) when already current -- matters because installer.nsi re-runs this on every reinstall/repair/upgrade, not just the first install. Failure here is non-fatal -- the app still runs on CPU. |
 | `scripts/check_ollama.ps1` | Run after install regardless of components chosen. Detects Ollama, compares its version against GitHub's latest release tag, and emits one line (`MISSING` / `OK:<v>` / `UPDATE:<old>:<new>` / `UNKNOWN:<reason>`) that `installer.nsi` turns into a native Yes/No prompt to open the download page. Never fails the install -- a network hiccup here just skips the prompt. |
 | `scripts/make_icon.py` | Generates `assets/chaselate.ico` / `assets/chaselate.png`. Drawn programmatically (no external art), matching `chaselate/ui/overlay.py`'s own runtime-drawn tray icon -- same three-chevron mark, same palette as `chaselate/ui/style.py`'s dark theme. Re-run only if you want to change the design; the output is checked in, not regenerated on every build. |
 | `assets/chaselate.ico` | The exe/installer icon `chaselate.spec` and `installer.nsi` both point at. |
@@ -71,6 +71,20 @@ component in the installer downloads separately, on the target machine).
 - **`SF_SELECTED` / component defaults.** The CUDA component is unchecked by default
   (`Section /o "..."`) given the ~1.9 GB download; don't flip that without a good reason, a
   lot of users don't have an NVIDIA GPU.
+- **`Invoke-WebRequest`'s default progress bar is not just cosmetic overhead -- it can make a
+  download nearly hang.** Confirmed the hard way: with stdout redirected (exactly how
+  `nsExec::ExecToLog` runs `download_cuda.ps1`), a 528 MB download sat at 0 MB for 10+ minutes
+  while the request thread visibly burned CPU on per-chunk progress updates, not network I/O.
+  `download_cuda.ps1` sets `$ProgressPreference = "SilentlyContinue"` at the top for exactly
+  this reason -- don't remove it, and set the same thing in any new script here that downloads
+  anything non-trivial.
+- **No version pin on the CUDA wheels, deliberately.** `download_cuda.ps1` always resolves
+  PyPI's current *latest* `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` rather than a hand-maintained
+  pinned version -- a deliberate choice to trade "guaranteed-tested combination" for "always
+  current, no manual bump commits". If a future PyPI release turns out to be incompatible with
+  the CTranslate2 build Chaselate ships, that surfaces at install time on a user's machine, not
+  in testing here -- if that ever happens, the fix is back at the wheel-selection logic in this
+  script, not somewhere in `chaselate/asr.py`.
 - **`QColor(str)` cannot parse `rgba(r, g, b, a)`.** `chaselate/ui/style.py`'s palettes write
   translucent colours in that CSS function form because QSS (Qt's stylesheet language)
   understands it fine -- but PyQt5's plain `QColor(some_string)` constructor does not, and
@@ -107,8 +121,12 @@ on: 341 files land at `%LOCALAPPDATA%\Programs\Chaselate`, the `HKCU` uninstall 
 the right name/version/publisher/size, the launched exe stays running and logs real
 recognition activity, and a silent uninstall removes the install directory, the registry key,
 and the Start Menu shortcut completely. `scripts/download_cuda.ps1` was also run standalone
-against a scratch directory and confirmed to fetch both pinned wheels, extract them, and
-land `cublas64_*.dll` at the expected path. The icon was checked by extracting it back out of
+against a scratch directory twice in a row: the first run resolved and fetched both
+latest-version wheels, extracted them, and landed `cublas64_*.dll`/`cudnn64_*.dll` at the
+expected paths (1.9 GB, seconds once `$ProgressPreference` was fixed rather than 10+ minutes
+stalled); the second run against the same directory correctly detected both packages already
+matched latest and finished in well under a second without touching the network. The icon was
+checked by extracting it back out of
 both the built `Chaselate.exe` and `ChaselateSetup-<version>.exe` with
 `[System.Drawing.Icon]::ExtractAssociatedIcon(...)` -- the one thing *not* separately verified
 is clicking through the installer's own Components page to select CUDA interactively (the

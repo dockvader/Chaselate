@@ -161,6 +161,10 @@ QWidget {{
     padding: 3px 6px;
     min-width: 22px;
 }}
+#IconButton:checked {{
+    background: {c["accent_dim"]};
+    border-color: {c["accent"]};
+}}
 #StatusText {{
     color: {c["text_dim"]};
     font-size: {small_pt}pt;
